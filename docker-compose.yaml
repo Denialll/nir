@@ -1,0 +1,36 @@
+services:
+
+  buildkitd:
+    image: moby/buildkit:latest
+    container_name: buildkitd
+    privileged: true
+    restart: unless-stopped
+    command: --addr tcp://0.0.0.0:8888
+    ports:
+      - "127.0.0.1:8888:8888"
+
+  backend3:
+    group_add:
+      - "${DOCKER_GID:-999}"
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TRIVY_VERSION: "0.61.0"
+        COPA_VERSION: "0.10.0"
+    container_name: secure-k8s-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      TRIVY_BIN: trivy
+      COPA_BIN: copa
+      # Адрес buildkitd — copa будет слать туда запросы
+      COPA_BUILDKIT_ADDR: tcp://buildkitd:8888
+      PROCESS_TIMEOUT: "600"
+      REPORTS_DIR: /tmp/secure-k8s/reports
+    volumes:
+      # copa патчит образы через Docker-демон хоста
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - buildkitd
