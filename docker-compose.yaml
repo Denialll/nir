@@ -8,6 +8,8 @@ services:
     command: --addr tcp://0.0.0.0:8888
     ports:
       - "127.0.0.1:8888:8888"
+    networks:
+      - harbor
 
   backend3:
     group_add:
@@ -18,19 +20,24 @@ services:
       args:
         TRIVY_VERSION: "0.61.0"
         COPA_VERSION: "0.10.0"
-    container_name: secure-k8s-backend
+    container_name: autopatch-backend
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
       TRIVY_BIN: trivy
       COPA_BIN: copa
-      # Адрес buildkitd — copa будет слать туда запросы
       COPA_BUILDKIT_ADDR: tcp://buildkitd:8888
       PROCESS_TIMEOUT: "600"
       REPORTS_DIR: /tmp/secure-k8s/reports
     volumes:
-      # copa патчит образы через Docker-демон хоста
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - buildkitd
+    networks:
+      - harbor
+
+networks:
+  harbor:
+    name: harbor_harbor
+    external: true

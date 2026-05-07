@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Trivy через официальный apt-репозиторий
+# Trivy
 RUN apt-get update && apt-get install -y --no-install-recommends wget apt-transport-https gnupg \
     && wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
         | gpg --dearmor > /usr/share/keyrings/trivy.gpg \
@@ -45,15 +45,13 @@ COPY --from=builder /install /usr/local
 WORKDIR /app
 COPY app/ ./app/
 
-# Создаём пользователя и добавляем в группу docker для доступа к socket
+# Создание пользователя и добавление его в группу docker
 RUN useradd --create-home --shell /bin/false appuser \
     && groupadd -f docker \
     && usermod -aG docker appuser \
     && mkdir -p /tmp/secure-k8s/reports \
     && mkdir -p /home/appuser/.cache \
     && chown -R appuser:appuser /app /tmp/secure-k8s /home/appuser
-
-# USER appuser  # запуск от root для доступа к docker.sock
 
 EXPOSE 8000
 
