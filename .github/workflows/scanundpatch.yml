@@ -1,0 +1,195 @@
+name: Security Scan & Patch
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Образ для сканирования"
+        required: true
+        default: "nginx:1.21"
+      output_tag:
+        description: "Тег пропатченного образа (необязательно)"
+        required: false
+        default: ""
+      push_to_registry:
+        description: "Пушить образ в registry?"
+        required: true
+        type: boolean
+        default: false
+      registry_url:
+        description: "URL registry (например harbordm.kubectlkhl.ru:444)"
+        required: false
+        default: ""
+      registry_project:
+        description: "Проект в registry (например test)"
+        required: false
+        default: ""
+      registry_username:
+        description: "Логин в registry"
+        required: false
+        default: ""
+      registry_password:
+        description: "Пароль / токен registry"
+        required: false
+        default: ""
+
+jobs:
+  scan-and-patch:
+    name: Scan & Patch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Маскируем чувствительные данные
+        run: |
+          # Всё что попадёт в логи после этого шага — будет скрыто как ***
+          echo "::add-mask::${{ github.event.inputs.registry_password }}"
+          echo "::add-mask::${{ github.event.inputs.registry_username }}"
+          echo "::add-mask::${{ secrets.HARBOR_PASSWORD }}"
+          echo "::add-mask::${{ secrets.HARBOR_USERNAME }}"
+
+      - name: Определяем параметры
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "image=${{ github.event.inputs.image }}" >> $GITHUB_OUTPUT
+            echo "output_tag=${{ github.event.inputs.output_tag }}" >> $GITHUB_OUTPUT
+            echo "push=${{ github.event.inputs.push_to_registry }}" >> $GITHUB_OUTPUT
+            echo "registry_url=${{ github.event.inputs.registry_url }}" >> $GITHUB_OUTPUT
+            echo "registry_project=${{ github.event.inputs.registry_project }}" >> $GITHUB_OUTPUT
+            # Чувствительные данные — только в маскированные outputs
+            echo "registry_username=${{ github.event.inputs.registry_username }}" >> $GITHUB_OUTPUT
+            echo "registry_password=${{ github.event.inputs.registry_password }}" >> $GITHUB_OUTPUT
+          else
+            IMAGE=$(cat image.txt 2>/dev/null || echo "nginx:1.21")
+            echo "image=$IMAGE" >> $GITHUB_OUTPUT
+            echo "output_tag=" >> $GITHUB_OUTPUT
+            echo "push=true" >> $GITHUB_OUTPUT
+            echo "registry_url=${{ secrets.HARBOR_URL }}" >> $GITHUB_OUTPUT
+            echo "registry_project=${{ secrets.HARBOR_PROJECT }}" >> $GITHUB_OUTPUT
+            echo "registry_username=${{ secrets.HARBOR_USERNAME }}" >> $GITHUB_OUTPUT
+            echo "registry_password=${{ secrets.HARBOR_PASSWORD }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Валидация registry-параметров
+        if: steps.params.outputs.push == 'true'
+        run: |
+          if [ -z "${{ steps.params.outputs.registry_url }}" ] || \
+             [ -z "${{ steps.params.outputs.registry_project }}" ] || \
+             [ -z "${{ steps.params.outputs.registry_username }}" ] || \
+             [ -z "${{ steps.params.outputs.registry_password }}" ]; then
+            echo "Ошибка: включён пуш в registry, но не все параметры заполнены."
+            echo "Нужны: registry_url, registry_project, registry_username, registry_password"
+            exit 1
+          fi
+          echo "Registry: ${{ steps.params.outputs.registry_url }}/${{ steps.params.outputs.registry_project }}"
+
+      - name: Сканирование образа
+        id: scan
+        run: |
+          echo "Сканируем: ${{ steps.params.outputs.image }}"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --max-time 300 \
+            -X POST "https://autopatch.kubectlkhl.ru/scan" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"image\": \"${{ steps.params.outputs.image }}\",
+              \"severity\": [\"CRITICAL\", \"HIGH\"],
+              \"ignore_unfixed\": true
+            }")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "Статус: $HTTP_CODE"
+          echo "$BODY" | jq .
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Ошибка сканирования: $BODY"
+            exit 1
+          fi
+
+          SCAN_ID=$(echo "$BODY" | jq -r '.scan_id')
+          TOTAL=$(echo "$BODY" | jq -r '.total_vulnerabilities')
+
+          echo "scan_id=$SCAN_ID" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+
+          echo "### Сканирование" >> $GITHUB_STEP_SUMMARY
+          echo "- Образ: \`${{ steps.params.outputs.image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Уязвимостей: **$TOTAL**" >> $GITHUB_STEP_SUMMARY
+          echo "$BODY" | jq -r '.by_severity | to_entries[] | "- \(.key): \(.value)"' >> $GITHUB_STEP_SUMMARY
+
+      - name: Патчинг без пуша
+        if: steps.scan.outputs.total != '0' && steps.params.outputs.push != 'true'
+        run: |
+          echo "Патчим без пуша..."
+
+          OUTPUT_TAG="${{ steps.params.outputs.output_tag }}"
+          OUTPUT_TAG_JSON=$([ -n "$OUTPUT_TAG" ] && echo "\"output_tag\": \"$OUTPUT_TAG\"," || echo "")
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --max-time 600 \
+            -X POST "https://autopatch.kubectlkhl.ru/patch" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"scan_id\": \"${{ steps.scan.outputs.scan_id }}\",
+              $OUTPUT_TAG_JSON
+              \"registry\": null
+            }")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "Статус: $HTTP_CODE"
+          echo "$BODY" | jq .
+
+          [ "$HTTP_CODE" != "200" ] && echo "Ошибка: $BODY" && exit 1
+
+          echo "### Патчинг (без пуша)" >> $GITHUB_STEP_SUMMARY
+          echo "- Пропатченный образ: \`$(echo $BODY | jq -r '.patched_image')\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Патчинг с пушем в registry
+        if: steps.scan.outputs.total != '0' && steps.params.outputs.push == 'true'
+        run: |
+          echo "Патчим и пушим в ${{ steps.params.outputs.registry_url }}/${{ steps.params.outputs.registry_project }}..."
+
+          OUTPUT_TAG="${{ steps.params.outputs.output_tag }}"
+          OUTPUT_TAG_JSON=$([ -n "$OUTPUT_TAG" ] && echo "\"output_tag\": \"$OUTPUT_TAG\"," || echo "")
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --max-time 600 \
+            -X POST "https://autopatch.kubectlkhl.ru/patch" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"scan_id\": \"${{ steps.scan.outputs.scan_id }}\",
+              $OUTPUT_TAG_JSON
+              \"registry\": {
+                \"url\": \"${{ steps.params.outputs.registry_url }}\",
+                \"project\": \"${{ steps.params.outputs.registry_project }}\",
+                \"username\": \"${{ steps.params.outputs.registry_username }}\",
+                \"password\": \"${{ steps.params.outputs.registry_password }}\"
+              }
+            }")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "Статус: $HTTP_CODE"
+          echo "$BODY" | jq .
+
+          [ "$HTTP_CODE" != "200" ] && echo "Ошибка: $BODY" && exit 1
+
+          echo "### Патчинг с пушем" >> $GITHUB_STEP_SUMMARY
+          echo "- Пропатченный образ: \`$(echo $BODY | jq -r '.patched_image')\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Запушен в: \`$(echo $BODY | jq -r '.pushed_image')\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Уязвимостей не найдено
+        if: steps.scan.outputs.total == '0'
+        run: |
+          echo "Уязвимостей не найдено — патчинг не требуется"
+          echo "### ✅ Уязвимостей не найдено" >> $GITHUB_STEP_SUMMARY
