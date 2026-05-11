@@ -1,0 +1,18 @@
+name: Security Scan
+on: [push, pull_request]
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t app:${{ github.sha }} .
+      - name: Run security scan
+        run: |
+          pip install -r requirements.txt
+          python scanner.py --image app:${{ github.sha }}
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: scan-report
+          path: scan-report.json
