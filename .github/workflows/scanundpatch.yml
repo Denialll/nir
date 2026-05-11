@@ -1,6 +1,10 @@
 name: Security Scan & Patch
 
 on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
   workflow_dispatch:
     inputs:
       image:
@@ -41,7 +45,6 @@ jobs:
     steps:
       - name: Маскируем чувствительные данные
         run: |
-          # Всё что попадёт в логи после этого шага — будет скрыто как ***
           echo "::add-mask::${{ github.event.inputs.registry_password }}"
           echo "::add-mask::${{ github.event.inputs.registry_username }}"
           echo "::add-mask::${{ secrets.HARBOR_PASSWORD }}"
@@ -56,7 +59,6 @@ jobs:
             echo "push=${{ github.event.inputs.push_to_registry }}" >> $GITHUB_OUTPUT
             echo "registry_url=${{ github.event.inputs.registry_url }}" >> $GITHUB_OUTPUT
             echo "registry_project=${{ github.event.inputs.registry_project }}" >> $GITHUB_OUTPUT
-            # Чувствительные данные — только в маскированные outputs
             echo "registry_username=${{ github.event.inputs.registry_username }}" >> $GITHUB_OUTPUT
             echo "registry_password=${{ github.event.inputs.registry_password }}" >> $GITHUB_OUTPUT
           else
@@ -78,10 +80,13 @@ jobs:
              [ -z "${{ steps.params.outputs.registry_username }}" ] || \
              [ -z "${{ steps.params.outputs.registry_password }}" ]; then
             echo "Ошибка: включён пуш в registry, но не все параметры заполнены."
-            echo "Нужны: registry_url, registry_project, registry_username, registry_password"
             exit 1
           fi
           echo "Registry: ${{ steps.params.outputs.registry_url }}/${{ steps.params.outputs.registry_project }}"
+
+      # Папка для артефактов
+      - name: Подготовка папки для артефактов
+        run: mkdir -p artifacts
 
       - name: Сканирование образа
         id: scan
@@ -101,9 +106,6 @@ jobs:
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | head -n -1)
 
-          echo "Статус: $HTTP_CODE"
-          echo "$BODY" | jq .
-
           if [ "$HTTP_CODE" != "200" ]; then
             echo "Ошибка сканирования: $BODY"
             exit 1
@@ -115,16 +117,19 @@ jobs:
           echo "scan_id=$SCAN_ID" >> $GITHUB_OUTPUT
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
 
+          # Сохраняем отчёт Trivy как артефакт
+          echo "$BODY" | jq . > artifacts/trivy-report.json
+          echo "Статус сканирования: $HTTP_CODE, уязвимостей: $TOTAL"
+
           echo "### Сканирование" >> $GITHUB_STEP_SUMMARY
           echo "- Образ: \`${{ steps.params.outputs.image }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Уязвимостей: **$TOTAL**" >> $GITHUB_STEP_SUMMARY
           echo "$BODY" | jq -r '.by_severity | to_entries[] | "- \(.key): \(.value)"' >> $GITHUB_STEP_SUMMARY
 
       - name: Патчинг без пуша
+        id: patch_no_push
         if: steps.scan.outputs.total != '0' && steps.params.outputs.push != 'true'
         run: |
-          echo "Патчим без пуша..."
-
           OUTPUT_TAG="${{ steps.params.outputs.output_tag }}"
           OUTPUT_TAG_JSON=$([ -n "$OUTPUT_TAG" ] && echo "\"output_tag\": \"$OUTPUT_TAG\"," || echo "")
 
@@ -141,19 +146,19 @@ jobs:
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | head -n -1)
 
-          echo "Статус: $HTTP_CODE"
-          echo "$BODY" | jq .
-
           [ "$HTTP_CODE" != "200" ] && echo "Ошибка: $BODY" && exit 1
+
+          # Сохраняем лог Copa
+          echo "$BODY" | jq -r '.copa_log // "no log"' > artifacts/copa-log.txt
+          echo "$BODY" | jq . > artifacts/patch-result.json
 
           echo "### Патчинг (без пуша)" >> $GITHUB_STEP_SUMMARY
           echo "- Пропатченный образ: \`$(echo $BODY | jq -r '.patched_image')\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Патчинг с пушем в registry
+        id: patch_with_push
         if: steps.scan.outputs.total != '0' && steps.params.outputs.push == 'true'
         run: |
-          echo "Патчим и пушим в ${{ steps.params.outputs.registry_url }}/${{ steps.params.outputs.registry_project }}..."
-
           OUTPUT_TAG="${{ steps.params.outputs.output_tag }}"
           OUTPUT_TAG_JSON=$([ -n "$OUTPUT_TAG" ] && echo "\"output_tag\": \"$OUTPUT_TAG\"," || echo "")
 
@@ -175,10 +180,11 @@ jobs:
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | head -n -1)
 
-          echo "Статус: $HTTP_CODE"
-          echo "$BODY" | jq .
-
           [ "$HTTP_CODE" != "200" ] && echo "Ошибка: $BODY" && exit 1
+
+          # Сохраняем лог Copa
+          echo "$BODY" | jq -r '.copa_log // "no log"' > artifacts/copa-log.txt
+          echo "$BODY" | jq . > artifacts/patch-result.json
 
           echo "### Патчинг с пушем" >> $GITHUB_STEP_SUMMARY
           echo "- Пропатченный образ: \`$(echo $BODY | jq -r '.patched_image')\`" >> $GITHUB_STEP_SUMMARY
@@ -188,4 +194,14 @@ jobs:
         if: steps.scan.outputs.total == '0'
         run: |
           echo "Уязвимостей не найдено — патчинг не требуется"
+          echo "no vulnerabilities found" > artifacts/copa-log.txt
           echo "### ✅ Уязвимостей не найдено" >> $GITHUB_STEP_SUMMARY
+
+      # Загружаем артефакты — выполняется всегда, даже если предыдущие шаги упали
+      - name: Сохранение артефактов
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 30
