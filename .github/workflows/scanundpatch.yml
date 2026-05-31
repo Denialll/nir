@@ -58,6 +58,7 @@ jobs:
             echo "image=${{ github.event.inputs.image }}" >> $GITHUB_OUTPUT
             echo "output_tag=${{ github.event.inputs.output_tag }}" >> $GITHUB_OUTPUT
             echo "push=${{ github.event.inputs.push_to_registry }}" >> $GITHUB_OUTPUT
+            echo "block=${{ github.event.inputs.block_push_on_vuln }}" >> $GITHUB_OUTPUT
             echo "registry_url=${{ github.event.inputs.registry_url }}" >> $GITHUB_OUTPUT
             echo "registry_project=${{ github.event.inputs.registry_project }}" >> $GITHUB_OUTPUT
             echo "registry_username=${{ github.event.inputs.registry_username }}" >> $GITHUB_OUTPUT
@@ -67,6 +68,7 @@ jobs:
             echo "image=$IMAGE" >> $GITHUB_OUTPUT
             echo "output_tag=" >> $GITHUB_OUTPUT
             echo "push=true" >> $GITHUB_OUTPUT
+            echo "block=true" >> $GITHUB_OUTPUT
             echo "registry_url=${{ secrets.HARBOR_URL }}" >> $GITHUB_OUTPUT
             echo "registry_project=${{ secrets.HARBOR_PROJECT }}" >> $GITHUB_OUTPUT
             echo "registry_username=${{ secrets.HARBOR_USERNAME }}" >> $GITHUB_OUTPUT
@@ -85,7 +87,6 @@ jobs:
           fi
           echo "Registry: ${{ steps.params.outputs.registry_url }}/${{ steps.params.outputs.registry_project }}"
 
-      # Папка для артефактов
       - name: Подготовка папки для артефактов
         run: mkdir -p artifacts
 
@@ -114,17 +115,22 @@ jobs:
 
           SCAN_ID=$(echo "$BODY" | jq -r '.scan_id')
           TOTAL=$(echo "$BODY" | jq -r '.total_vulnerabilities')
+          CRITICAL=$(echo "$BODY" | jq -r '.by_severity.CRITICAL // 0')
+          HIGH=$(echo "$BODY" | jq -r '.by_severity.HIGH // 0')
+          BLOCKING=$((CRITICAL + HIGH))
 
           echo "scan_id=$SCAN_ID" >> $GITHUB_OUTPUT
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH" >> $GITHUB_OUTPUT
+          echo "blocking=$BLOCKING" >> $GITHUB_OUTPUT
 
-          # Сохраняем отчёт Trivy как артефакт
           echo "$BODY" | jq . > artifacts/trivy-report.json
-          echo "Статус сканирования: $HTTP_CODE, уязвимостей: $TOTAL"
+          echo "Статус сканирования: $HTTP_CODE, уязвимостей: $TOTAL (CRITICAL=$CRITICAL, HIGH=$HIGH)"
 
           echo "### Сканирование" >> $GITHUB_STEP_SUMMARY
           echo "- Образ: \`${{ steps.params.outputs.image }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Уязвимостей: **$TOTAL**" >> $GITHUB_STEP_SUMMARY
+          echo "- Уязвимостей: **$TOTAL** (CRITICAL: $CRITICAL, HIGH: $HIGH)" >> $GITHUB_STEP_SUMMARY
           echo "$BODY" | jq -r '.by_severity | to_entries[] | "- \(.key): \(.value)"' >> $GITHUB_STEP_SUMMARY
 
       - name: Policy gate — CRITICAL/HIGH
@@ -133,7 +139,7 @@ jobs:
           PUSH="${{ steps.params.outputs.push }}"
           BLOCK="${{ steps.params.outputs.block }}"
           BLOCKING="${{ steps.scan.outputs.blocking }}"
- 
+
           if [ "$PUSH" = "true" ] && [ "$BLOCK" = "true" ] && [ "$BLOCKING" -gt 0 ]; then
             echo "push_allowed=false" >> $GITHUB_OUTPUT
             echo "blocked=true" >> $GITHUB_OUTPUT
@@ -146,7 +152,7 @@ jobs:
 
       - name: Патчинг без пуша
         id: patch_no_push
-        if: steps.scan.outputs.total != '0' && steps.params.outputs.push != 'true'
+        if: steps.scan.outputs.total != '0' && steps.gate.outputs.push_allowed != 'true'
         run: |
           OUTPUT_TAG="${{ steps.params.outputs.output_tag }}"
           OUTPUT_TAG_JSON=$([ -n "$OUTPUT_TAG" ] && echo "\"output_tag\": \"$OUTPUT_TAG\"," || echo "")
@@ -170,12 +176,16 @@ jobs:
           echo "$BODY" | jq -r '.copa_log // "no log"' > artifacts/copa-log.txt
           echo "$BODY" | jq . > artifacts/patch-result.json
 
-          echo "### Патчинг (без пуша)" >> $GITHUB_STEP_SUMMARY
-          echo "- Пропатченный образ: \`$(echo $BODY | jq -r '.patched_image')\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.gate.outputs.blocked }}" = "true" ]; then
+            echo "### Патчинг (пуш заблокирован политикой)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Патчинг (без пуша)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- Пропатченный образ (локально): \`$(echo $BODY | jq -r '.patched_image')\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Патчинг с пушем в registry
         id: patch_with_push
-        if: steps.scan.outputs.total != '0' && steps.params.outputs.push == 'true'
+        if: steps.scan.outputs.total != '0' && steps.gate.outputs.push_allowed == 'true'
         run: |
           OUTPUT_TAG="${{ steps.params.outputs.output_tag }}"
           OUTPUT_TAG_JSON=$([ -n "$OUTPUT_TAG" ] && echo "\"output_tag\": \"$OUTPUT_TAG\"," || echo "")
@@ -214,6 +224,20 @@ jobs:
           echo "Уязвимостей не найдено — патчинг не требуется"
           echo "no vulnerabilities found" > artifacts/copa-log.txt
           echo "### ✅ Уязвимостей не найдено" >> $GITHUB_STEP_SUMMARY
+
+      # Применение policy gate: роняем джобу, если пуш был заблокирован.
+      # Стоит ПОСЛЕ патчинга без пуша, чтобы артефакт-отчёт всё равно сформировался,
+      # и ДО upload-artifact (он с if: always() — отчёты загрузятся даже при падении).
+      - name: Применение policy gate
+        if: steps.gate.outputs.blocked == 'true'
+        run: |
+          echo "::error::Пуш в registry заблокирован policy gate: найдено CRITICAL=${{ steps.scan.outputs.critical }}, HIGH=${{ steps.scan.outputs.high }} (порог: хотя бы одна)."
+          echo "### ⛔ Пуш заблокирован policy gate" >> $GITHUB_STEP_SUMMARY
+          echo "- Найдено CRITICAL: **${{ steps.scan.outputs.critical }}**" >> $GITHUB_STEP_SUMMARY
+          echo "- Найдено HIGH: **${{ steps.scan.outputs.high }}**" >> $GITHUB_STEP_SUMMARY
+          echo "- Образ запушен **НЕ был**. Пропатченный кандидат собран локально для ревью." >> $GITHUB_STEP_SUMMARY
+          echo "- Отключить блокировку: запустить workflow с \`block_push_on_vuln = false\`." >> $GITHUB_STEP_SUMMARY
+          exit 1
 
       # Загружаем артефакты — выполняется всегда, даже если предыдущие шаги упали
       - name: Сохранение артефактов
