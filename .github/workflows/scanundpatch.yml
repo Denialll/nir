@@ -16,6 +16,11 @@ on:
         required: true
         type: boolean
         default: false
+      block_push_on_vuln:
+        description: "Блокировать пуш в registry при наличии хотя бы одной CRITICAL/HIGH уязвимости"
+        required: true
+        type: boolean
+        default: true
       registry_url:
         description: "URL registry (например harbordm.kubectlkhl.ru:444)"
         required: false
@@ -121,6 +126,23 @@ jobs:
           echo "- Образ: \`${{ steps.params.outputs.image }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Уязвимостей: **$TOTAL**" >> $GITHUB_STEP_SUMMARY
           echo "$BODY" | jq -r '.by_severity | to_entries[] | "- \(.key): \(.value)"' >> $GITHUB_STEP_SUMMARY
+
+      - name: Policy gate — CRITICAL/HIGH
+        id: gate
+        run: |
+          PUSH="${{ steps.params.outputs.push }}"
+          BLOCK="${{ steps.params.outputs.block }}"
+          BLOCKING="${{ steps.scan.outputs.blocking }}"
+ 
+          if [ "$PUSH" = "true" ] && [ "$BLOCK" = "true" ] && [ "$BLOCKING" -gt 0 ]; then
+            echo "push_allowed=false" >> $GITHUB_OUTPUT
+            echo "blocked=true" >> $GITHUB_OUTPUT
+            echo "Policy gate: ПУШ ЗАБЛОКИРОВАН (CRITICAL/HIGH = $BLOCKING)"
+          else
+            echo "push_allowed=$PUSH" >> $GITHUB_OUTPUT
+            echo "blocked=false" >> $GITHUB_OUTPUT
+            echo "Policy gate: пуш разрешён (push=$PUSH, block=$BLOCK, blocking=$BLOCKING)"
+          fi
 
       - name: Патчинг без пуша
         id: patch_no_push
