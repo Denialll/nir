@@ -235,7 +235,7 @@ jobs:
           echo "### ⛔ Пуш заблокирован policy gate" >> $GITHUB_STEP_SUMMARY
           echo "- Найдено CRITICAL: **${{ steps.scan.outputs.critical }}**" >> $GITHUB_STEP_SUMMARY
           echo "- Найдено HIGH: **${{ steps.scan.outputs.high }}**" >> $GITHUB_STEP_SUMMARY
-          echo "- Образ запушен **НЕ был**. Пропатченный кандидат собран локально для ревью." >> $GITHUB_STEP_SUMMARY
+          echo "- Образ запушен **НЕ был**." >> $GITHUB_STEP_SUMMARY
           echo "- Отключить блокировку: запустить workflow с \`block_push_on_vuln = false\`." >> $GITHUB_STEP_SUMMARY
           exit 1
 
